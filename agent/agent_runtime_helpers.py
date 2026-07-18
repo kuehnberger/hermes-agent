@@ -2335,6 +2335,7 @@ def _has_litellm_token(value: str, delimiters: str) -> bool:
 
 
 def anthropic_prompt_cache_policy(
+    agent,
     *,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
