@@ -1743,6 +1743,7 @@ def dump_api_response_debug(
 
 
 def anthropic_prompt_cache_policy(
+    agent,
     *,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
