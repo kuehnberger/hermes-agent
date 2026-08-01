@@ -1,4 +1,5 @@
 import unittest
+import inspect
 from unittest.mock import MagicMock
 
 from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
@@ -42,6 +43,25 @@ class AnthropicPromptCachePolicySignatureTest(unittest.TestCase):
             base_url=None,
             api_mode=None,
             model=None,
+        )
+        self.assertEqual(len(result), 2)
+        for item in result:
+            self.assertIsInstance(item, bool)
+
+    def test_signature_pins_agent_as_positional_no_default(self):
+        sig = inspect.signature(anthropic_prompt_cache_policy)
+        params = list(sig.parameters.values())
+        self.assertEqual(params[0].name, "agent")
+        self.assertEqual(params[0].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        self.assertEqual(params[0].default, inspect.Parameter.empty)
+
+    def test_direct_call_no_overrides_returns_bool_pair(self):
+        result = anthropic_prompt_cache_policy(
+            self.agent,
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+            api_mode="chat",
+            model="gpt-4o",
         )
         self.assertEqual(len(result), 2)
         for item in result:
