@@ -998,12 +998,7 @@ class TestUpstreamProviderError403:
         assert result.reason == FailoverReason.billing
         assert result.should_rotate_credential is True
 
-<<<<<<< HEAD
-
-
-=======
     def test_upstream_403_without_metadata_on_non_aggregator_not_matched(self):
-        ""    def test_upstream_403_without_metadata_on_non_aggregator_not_matched(self):
         """'Provider returned error' alone on a non-aggregator provider -> plain auth."""
         e = MockAPIError(
             "Provider returned error",
