@@ -2427,6 +2427,21 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     assert "".join(reasoning_streamed) == "Need to inspect files."
 
 
+def _codex_openai_response(*, content="Hello.", finish_reason="stop"):
+    """Minimal OpenAI-style chat.completions response object."""
+    return SimpleNamespace(
+        model="gpt-5-codex",
+        id="resp_001",
+        created=1763456789,
+        object="chat.completion",
+        finish_reason=finish_reason,
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(role="assistant", content=content),
+            finish_reason=finish_reason,
+        )],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
 def test_dump_api_response_debug_redacts_auth_headers(monkeypatch, tmp_path):
     """Response dump must match the request dumper: auth headers redacted, not leaked."""
     import json
@@ -2550,3 +2565,55 @@ def test_run_conversation_skips_response_dump_when_gate_off(monkeypatch, tmp_pat
     dumps = glob.glob(str(tmp_path / "response_dump_*.json"))
     assert not dumps, "response dump must NOT be written when gate is off"
 
+
+def test_run_conversation_writes_response_dump_on_invalid_response_when_gated(monkeypatch, tmp_path):
+    """Reviewer point: an invalid-response branch must write a response dump when
+    HERMES_DUMP_REQUESTS=1. Force validate_response to return False and assert
+    at least one response dump in logs_dir carries reason='invalid_response'.
+    """
+    import glob
+    agent = _build_agent(monkeypatch)
+    agent.logs_dir = tmp_path
+    monkeypatch.setenv("HERMES_DUMP_REQUESTS", "1")
+
+    # Return a response that will fail validate_response in codex_responses transport:
+    # an object with response.output = [] (empty list) and status != incomplete or
+    # incomplete_details.reason != 'content_filter' → triggers response_invalid=True
+    class _BadCodexResponse:
+        def __init__(self):
+            self.output = []  # empty → invalid
+            self.status = "completed"  # not incomplete/content_filter
+            self.incomplete_details = None
+            self.usage = SimpleNamespace(input_tokens=1, output_tokens=0, total_tokens=1)
+            self.model = "gpt-5-codex"
+            # minimal headers for the dump helper
+            self.headers = {"Content-Type": "application/json"}
+
+    bad_response = _BadCodexResponse()
+
+    responses = [bad_response, _codex_message_response("Done.")]  # second call succeeds
+
+    def _fake_api_call(api_kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("ping")
+    assert result["completed"] is True
+
+    dumps = glob.glob(str(tmp_path / "response_dump_*.json"))
+    assert dumps, "expected a response_dump file after an invalid-response turn"
+
+    import json
+    invalid_dumps = []
+    for dump_path in dumps:
+        payload = json.loads(open(dump_path).read())
+        if payload.get("reason") == "invalid_response":
+            invalid_dumps.append(dump_path)
+    assert invalid_dumps, f"expected an invalid_response dump among: {dumps}"
+    # Should have captured the response under the 'response' key
+    payload = json.loads(open(invalid_dumps[0]).read())
+    assert "response" in payload
+
+    # The dump must be redactable and load cleanly regardless of shape.
+    assert "headers" in payload or payload["response"] is None
