@@ -163,5 +163,126 @@ class TestParseSystemdDuration:
         assert sf.parse_systemd_duration_to_us("3min") == 180 * 1_000_000
 
 # ---------------------------------------------------------------------------
+# _systemd_timeout_stop_us (#132565)
+# ---------------------------------------------------------------------------
+
+class _FakeCompleted:
+    def __init__(self, returncode: int, stdout: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _systemctl_stub(monkeypatch, per_flag: dict):
+    """Run argv -> _FakeCompleted from `per_flag` ("--user" / ""), recording the calls."""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert "--user" in cmd or cmd.index("systemctl") == 0
+        for key, value in per_flag.items():
+            if key == "user" and "--user" in cmd:
+                return _FakeCompleted(0, value)
+            if key == "system" and "--user" not in cmd:
+                return _FakeCompleted(0, value)
+        return _FakeCompleted(1, "")
+
+    monkeypatch.setattr(sf.subprocess, "run", _fake_run)
+    return calls
+
+
+class TestSystemdTimeoutStopUs:
+    def test_system_unit_not_found_in_user_manager_falls_through(self, monkeypatch):
+        """A system-only unit: `systemctl --user show` answers rc=0 with the DEFAULT 1min 30s.
+        That default must not win — the system manager's value (#132565) does."""
+        calls = _systemctl_stub(monkeypatch, {
+            "user": "LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            "system": "LoadState=loaded\nTimeoutStopUSec=3min 30s\n",
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 210 * 1_000_000
+        assert len(calls) == 2, "the system query must still be issued"
+        assert "--user" in calls[0] and "--user" not in calls[1]
+
+    def test_user_unit_still_wins(self, monkeypatch):
+        calls = _systemctl_stub(monkeypatch, {
+            "user": "LoadState=loaded\nTimeoutStopUSec=1min 30s\n",
+            "system": "LoadState=loaded\nTimeoutStopUSec=10min\n",
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 90 * 1_000_000
+        assert len(calls) == 1, "a user unit must not trigger a system query"
+
+    def test_numeric_microseconds(self, monkeypatch):
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=loaded\nTimeoutStopUSec=210000000\n",
+            "system": "",
+        })
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 210_000_000
+
+    def test_unit_in_no_manager_returns_none(self, monkeypatch):
+        """Both managers not-found -> undeterminable, not the 90s default."""
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            "system": "LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+        })
+        assert sf._systemd_timeout_stop_us("nope.service") is None
+
+    def test_missing_loadstate_defaults_to_loaded(self, monkeypatch):
+        """Older systemd without LoadState in the answer: keep the pre-existing behaviour."""
+        _systemctl_stub(monkeypatch, {"user": "TimeoutStopUSec=2min\n", "system": ""})
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 120 * 1_000_000
+
+    def test_masked_unit_with_unit_file_still_counted(self, monkeypatch):
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=masked\nTimeoutStopUSec=4min\n", "system": ""})
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") == 240 * 1_000_000
+
+    def test_nonzero_returncode_skipped(self, monkeypatch):
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=loaded\nTimeoutStopUSec=1min 30s\n", "system": ""})
+        monkeypatch.setattr(sf.subprocess, "run",
+                            lambda cmd, **kw: _FakeCompleted(1, "TimeoutStopUSec=1min 30s\n"))
+        assert sf._systemd_timeout_stop_us("hermes-gateway.service") is None
+
+    def test_systemd_alignment_no_false_mismatch_for_system_unit(self, monkeypatch):
+        """End-to-end: a system unit sized for the stop budget must not warn 'stale unit'."""
+        monkeypatch.setenv("INVOCATION_ID", "deadbeef")
+        cgroup = "0::/system.slice/hermes-gateway.service\n"
+
+        class _FakeFile:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *exc): return False
+            def __iter__(self_inner): return iter(cgroup.splitlines(True))
+
+        monkeypatch.setattr(sf, "open", lambda *a, **kw: _FakeFile(), raising=False)
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            "system": "LoadState=loaded\nTimeoutStopUSec=210s\n",
+        })
+        result = sf.check_systemd_timing_alignment(drain_timeout=30.0, cron_drain_timeout=30.0)
+        assert result is not None
+        assert result["unit"] == "hermes-gateway.service"
+        assert result["timeout_stop_sec"] == 210.0
+        assert result["mismatch"] is False, result
+
+    def test_systemd_alignment_still_flags_genuinely_stale_system_unit(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "deadbeef")
+        cgroup = "0::/system.slice/hermes-gateway.service\n"
+
+        class _FakeFile2:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *exc): return False
+            def __iter__(self_inner): return iter(cgroup.splitlines(True))
+
+        monkeypatch.setattr(sf, "open", lambda *a, **kw: _FakeFile2(), raising=False)
+        _systemctl_stub(monkeypatch, {
+            "user": "LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            "system": "LoadState=loaded\nTimeoutStopUSec=60s\n",
+        })
+        result = sf.check_systemd_timing_alignment(drain_timeout=30.0, cron_drain_timeout=30.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 60.0
+        assert result["mismatch"] is True, result
+
+# ---------------------------------------------------------------------------
 # check_systemd_timing_alignment
 # ---------------------------------------------------------------------------

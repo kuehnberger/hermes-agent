@@ -226,22 +226,39 @@ def check_systemd_timing_alignment(
 
 
 def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
-    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual)."""
+    """``TimeoutStopUSec`` of ``unit_name`` in microseconds, from the manager that actually holds
+    the unit. ``--user`` first (hermes' usual), then the system manager.
+
+    ``systemctl show`` answers rc=0 for a unit the queried manager does not know, echoing the
+    compiled-in DEFAULT ``TimeoutStopUSec=1min 30s`` — so a *system* unit looked up via ``--user``
+    used to return 90s and short-circuit the system query, producing a false "stale unit" warning.
+    Hence ``LoadState``: only ``loaded`` (or ``error``/``masked`` with a real unit file) counts as
+    the manager owning the unit.
+    """
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                ["systemctl", *flag, "show", unit_name,
+                 "--property=TimeoutStopUSec", "--property=LoadState"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
             )
         except (subprocess.TimeoutExpired, OSError):
             continue
+        if result.returncode != 0:
+            continue
+        props: Dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                props[key.strip()] = value.strip()
+        if props.get("LoadState", "loaded") == "not-found":
+            continue  # wrong manager for this unit — ask the next one, not the default value
         # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
-        for line in result.stdout.splitlines() if result.returncode == 0 else ():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    return timeout_us
+        value = props.get("TimeoutStopUSec", "")
+        if value:
+            timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
+            if timeout_us is not None:
+                return timeout_us
     return None
 
 
