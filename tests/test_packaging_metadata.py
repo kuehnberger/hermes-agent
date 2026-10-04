@@ -3,9 +3,86 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _manifest():
+    return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+def _exclude_newer_package():
+    """Canonical-name -> cutoff (False, or an ISO timestamp). The table is
+    written by hand, so keys may use ``_`` or ``-``; PEP 503 canonicalisation
+    is what uv itself compares against the index name."""
+    return {
+        canonicalize_name(name): cutoff
+        for name, cutoff in _manifest()["tool"]["uv"]["exclude-newer-package"].items()
+    }
+
+
+def _exact_pins(manifest):
+    """Every (canonical name, pinned version) behind an ``==`` specifier,
+    across core, extras, dependency groups and build-system.requires."""
+    pins: dict[str, set] = {}
+
+    def harvest(specs):
+        for raw in specs or []:
+            if not isinstance(raw, str):
+                continue  # dependency-group include entries
+            requirement = Requirement(raw)
+            versions = {
+                spec.version
+                for spec in requirement.specifier
+                if spec.operator == "==" and "*" not in spec.version
+            }
+            if versions:
+                pins.setdefault(canonicalize_name(requirement.name), set()).update(versions)
+
+    project = manifest["project"]
+    harvest(project.get("dependencies"))
+    for specs in project.get("optional-dependencies", {}).values():
+        harvest(specs)
+    for group in (manifest.get("dependency-groups") or {}).values():
+        harvest(group if isinstance(group, list) else None)
+    harvest(manifest.get("build-system", {}).get("requires"))
+    return pins
+
+
+def test_exact_pinned_deps_exempt_from_exclude_newer():
+    # An ``==X.Y.Z`` pin cannot float, so exclude-newer adds no float
+    # protection for it while still bricking resolution on any index whose
+    # simple API omits per-file upload-time (uv then assumes "newer than the
+    # cutoff"). #132558: pilk==0.2.4 bricked `uv lock` on the Tsinghua mirror.
+    table = _exclude_newer_package()
+    missing = {
+        name: sorted(versions)
+        for name, versions in _exact_pins(_manifest()).items()
+        if name not in table
+    }
+    assert not missing, (
+        "exact-pinned dependencies missing from [tool.uv.exclude-newer-package]; "
+        f"add each as `false`: {missing}"
+    )
+
+
+def test_build_system_requires_exempt_from_exclude_newer():
+    # Isolated build environments resolve under the same cutoff, so an
+    # exact-pinned build requirement can fail to build at all.
+    table = _exclude_newer_package()
+    build_requires = _manifest()["build-system"]["requires"]
+    missing = [
+        Requirement(raw).name
+        for raw in build_requires
+        if not isinstance(raw, str)
+        or canonicalize_name(Requirement(raw).name) not in table
+    ]
+    assert not missing, (
+        "build-system.requires missing from [tool.uv.exclude-newer-package]; "
+        f"add each as `false`: {missing}"
+    )
 
 
 def test_test_dependencies_are_group_only_in_manifest_and_lock():
