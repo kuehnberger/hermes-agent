@@ -18,13 +18,29 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+# ``OWNER/REPO`` is the placeholder the error text below prints. It matches the
+# repo-slug shape exactly, so a templating/probe caller that writes the literal
+# placeholder used to be persisted as a genuine slug and could never be
+# satisfied (the named repo 404s at acceptance time, hours later, behind an
+# error that blames the caller's published PR). Reject it at write time (#132717).
+_PLACEHOLDER = re.compile(r"owner/repo", re.IGNORECASE)
 
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
-    if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
+    if not isinstance(value, str):
         raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+    repo_match, pr_match = _REPO.fullmatch(value), _PR.fullmatch(value)
+    if not repo_match and not pr_match:
+        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+    repo = repo_match.group(0) if repo_match is not None else ""
+    if pr_match is not None:
+        repo = pr_match.group(1)
+    if _PLACEHOLDER.fullmatch(repo) is not None:
+        raise ValueError(
+            f"completion_contract {value!r} names the OWNER/REPO placeholder, not a real "
+            "repository; pass the actual owner/repo slug or an exact GitHub PR URL")
     return value
 
 

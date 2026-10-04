@@ -230,3 +230,28 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+@pytest.mark.parametrize("placeholder", [
+    "OWNER/REPO", "owner/repo", "Owner/Repo",
+    "https://github.com/OWNER/REPO/pull/1", "https://github.com/owner/repo/pull/42",
+])
+def test_placeholder_completion_contract_is_rejected_at_write_time(placeholder):
+    """`OWNER/REPO` is the placeholder the validation error text prints, and it matches
+    the repo-slug shape exactly. Persisting it wedged the card permanently: the named repo
+    404s at acceptance time, hours later, behind an error that blamed the caller's PR.
+    The rejection has to happen where the cause can still be named."""
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    with pytest.raises(ValueError, match="placeholder"):
+        validate_contract(placeholder)
+
+
+def test_real_completion_contracts_still_validate():
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    assert validate_contract(None) == "local-only"
+    assert validate_contract("local-only") == "local-only"
+    for real in ("acme/repo", "NousResearch/hermes-agent",
+                 "https://github.com/acme/repo/pull/7"):
+        assert validate_contract(real) == real
