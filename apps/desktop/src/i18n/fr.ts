@@ -3497,11 +3497,11 @@ export const frOverrides = {
       SIGNAL_HTTP_URL: {
         label: 'URL du pont Signal',
         placeholder: 'http://127.0.0.1:8080',
-        help: "URL d'un pont REST signal-cli en cours d'exécution."
+        help: "URL d'un démon signal-cli en cours d'exécution (mode HTTP)."
       },
       SIGNAL_ACCOUNT: {
         label: 'Numéro de téléphone',
-        help: 'Le numéro enregistré avec votre pont signal-cli.'
+        help: 'Le numéro enregistré avec votre démon signal-cli.'
       },
       SIGNAL_ALLOWED_USERS: {
         label: 'Utilisateurs Signal autorisés',

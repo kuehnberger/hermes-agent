@@ -2070,9 +2070,9 @@ export const ja = defineLocale({
       SIGNAL_HTTP_URL: {
         label: 'Signal ブリッジ URL',
         placeholder: 'http://127.0.0.1:8080',
-        help: '実行中の signal-cli REST ブリッジの URL。'
+        help: '実行中の signal-cli デーモン（HTTP モード）の URL。'
       },
-      SIGNAL_ACCOUNT: { label: '電話番号', help: 'signal-cli ブリッジに登録した番号。' },
+      SIGNAL_ACCOUNT: { label: '電話番号', help: 'signal-cli デーモンに登録した番号。' },
       SIGNAL_ALLOWED_USERS: {
         label: '許可する Signal ユーザー',
         help: '推奨。カンマ区切りの Signal 識別子。'

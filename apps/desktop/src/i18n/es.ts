@@ -3479,11 +3479,11 @@ export const esOverrides = {
       SIGNAL_HTTP_URL: {
         label: 'URL del puente Signal',
         placeholder: 'http://127.0.0.1:8080',
-        help: 'URL de un puente REST signal-cli en ejecución.'
+        help: 'URL de un demonio signal-cli en ejecución (modo HTTP).'
       },
       SIGNAL_ACCOUNT: {
         label: 'Número de teléfono',
-        help: 'El número registrado con tu puente signal-cli.'
+        help: 'El número registrado en tu demonio signal-cli.'
       },
       SIGNAL_ALLOWED_USERS: {
         label: 'Usuarios de Signal permitidos',

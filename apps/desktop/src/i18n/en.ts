@@ -3069,9 +3069,9 @@ export const en: Translations = {
       SIGNAL_HTTP_URL: {
         label: 'Signal bridge URL',
         placeholder: 'http://127.0.0.1:8080',
-        help: 'URL of a running signal-cli REST bridge.'
+        help: 'URL of a running signal-cli daemon (HTTP mode).'
       },
-      SIGNAL_ACCOUNT: { label: 'Phone number', help: 'The number registered with your signal-cli bridge.' },
+      SIGNAL_ACCOUNT: { label: 'Phone number', help: 'The number registered with your signal-cli daemon.' },
       SIGNAL_ALLOWED_USERS: { label: 'Allowed Signal users', help: 'Recommended. Comma-separated Signal identifiers.' },
       WHATSAPP_ENABLED: {
         label: 'Enable WhatsApp bridge',

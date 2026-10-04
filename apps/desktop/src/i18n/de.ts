@@ -3485,11 +3485,11 @@ export const deOverrides = {
       SIGNAL_HTTP_URL: {
         label: 'Signal-Bridge-URL',
         placeholder: 'http://127.0.0.1:8080',
-        help: 'URL einer laufenden signal-cli-REST-Bridge.'
+        help: 'URL eines laufenden signal-cli-Daemons im HTTP-Modus.'
       },
       SIGNAL_ACCOUNT: {
         label: 'Telefonnummer',
-        help: 'Die Nummer, die bei Ihrer signal-cli-Bridge registriert ist.'
+        help: 'Die Nummer, die bei Ihrem signal-cli-Daemon registriert ist.'
       },
       SIGNAL_ALLOWED_USERS: {
         label: 'Erlaubte Signal-Benutzer',
