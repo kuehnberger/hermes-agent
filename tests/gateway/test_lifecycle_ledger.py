@@ -9,9 +9,14 @@ and enriches the report with the last heartbeat's memory sample.
 """
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import os
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -252,3 +257,224 @@ def test_replace_handover_is_not_a_death_and_pid_reuse_is(tmp_path: Path, monkey
     assert detect_unclean_exit(home=tmp_path) is None
     _write_sentinel(tmp_path, {**live, "start_time": 4000.0})  # born after the claim → reuser → death
     assert detect_unclean_exit(home=tmp_path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Discriminating reboot evidence — VM reboot vs SIGKILL/OOM
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_real_host_probe(monkeypatch) -> None:
+    """Keep the suite off the real Windows event log.
+
+    Every test below either wants no host evidence or installs its own canned
+    result; PowerShell's own output is covered by the ``_parse_host_probe`` tests,
+    which feed in the exact lines the probe prints.
+    """
+    monkeypatch.setattr("gateway.lifecycle_ledger._host_restart_evidence",
+                        lambda boot_epoch, since_epoch: None)
+
+
+def _unclean_life(home: Path, started: float, heartbeat: float | None = None) -> None:
+    """A dead ``phase=running`` life that began at ``started`` and was last seen beating at ``heartbeat``."""
+    _write_sentinel(home, {
+        "phase": "running",
+        "pid": _DEAD_PID,
+        "start_time": started,
+        "started_at": datetime.fromtimestamp(started, tz=timezone.utc).isoformat(),
+    })
+    if heartbeat is not None:
+        _write_heartbeat(home, {
+            "updated_at": datetime.fromtimestamp(heartbeat, tz=timezone.utc).isoformat(),
+            "mem": {"mem_total_kib": 1024 * 1024, "mem_available_kib": 512 * 1024},
+        })
+
+
+def _warned(caplog, home: Path) -> str:
+    """Run the boot report and return everything logged at WARNING for this module."""
+    with caplog.at_level(logging.WARNING, logger="gateway.lifecycle_ledger"):
+        assert record_startup(home=home) is not None
+    return caplog.text
+
+
+def test_rebooted_guest_is_named_and_reordered_in_the_warning(tmp_path: Path, caplog, monkeypatch) -> None:
+    """The gate: an unclean life plus a NEWER boot must say ``VM REBOOTED``, and the hint list must
+    lead with the external-shutdown explanation instead of the generic SIGKILL/OOM list."""
+    now = time.time()
+    _unclean_life(tmp_path, started=now - 3600, heartbeat=now - 1800)
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: now - 60)
+
+    text = _warned(caplog, tmp_path)
+
+    assert "exited UNCLEANLY (no exit path ran — EXTERNAL SHUTDOWN FIRST" in text
+    assert "check Windows Event 1074 first" in text
+    assert "exited UNCLEANLY (no exit path ran — SIGKILL" not in text
+    assert "VM REBOOTED between lives (new WSL boot " in text
+    assert " > prior last seen " in text
+    # The evidence is persisted with the exit-diag record, not just printed.
+    record = _exit_diag_records(tmp_path)[-1]
+    assert record["vm_rebooted"] is True
+    assert record["wsl_boot_at"] > record["prior_last_seen_at"]
+
+
+def test_same_boot_death_keeps_the_existing_warning_verbatim(tmp_path: Path, caplog, monkeypatch) -> None:
+    """A death inside a live guest (boot older than both marks) must not claim a reboot, and its
+    warning must stay exactly what it says today."""
+    now = time.time()
+    _unclean_life(tmp_path, started=now - 3600, heartbeat=now - 1800)
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: now - 7200)
+
+    text = _warned(caplog, tmp_path)
+
+    assert "exited UNCLEANLY (no exit path ran — SIGKILL / OOM / VM death, or a process kill issued by " in text
+    assert "VM REBOOTED" not in text
+    assert " | evidence: " not in text
+    assert "vm_rebooted" not in _exit_diag_records(tmp_path)[-1]
+
+
+def test_unknown_prior_timestamps_make_no_reboot_claim(tmp_path: Path, caplog, monkeypatch) -> None:
+    """No start and no heartbeat ⇒ the comparison cannot be made, so nothing is asserted."""
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID})
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: time.time() - 60)
+
+    text = _warned(caplog, tmp_path)
+
+    assert "VM REBOOTED" not in text
+    assert "exited UNCLEANLY (no exit path ran — SIGKILL" in text
+
+
+def test_host_restart_event_names_the_orderer(tmp_path: Path, caplog, monkeypatch) -> None:
+    """A 1074 in the death window is the orderer: the warning must carry its time, who ordered it,
+    and the host's vmIdleTimeout, and all of it must reach the exit-diag record."""
+    now = time.time()
+    _unclean_life(tmp_path, started=now - 3600, heartbeat=now - 1800)
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: now - 60)
+    monkeypatch.setattr(
+        "gateway.lifecycle_ledger._host_restart_evidence",
+        lambda boot_epoch, since_epoch: (
+            {"status": "hit", "at": "2026-10-05T16:29:33Z", "sid": "S-1-5-21-427566232-1001",
+             "message": 'Prozess "C:\\\\WINDOWS\\\\Explorer.EXE (YODA)" im Auftrag von "YODA\\\\gk"'},
+            {"status": "set", "path": "C:\\Users\\gk\\.wslconfig", "line": "vmIdleTimeout=-1"},
+        ),
+    )
+
+    text = _warned(caplog, tmp_path)
+
+    assert "Windows Event 1074 ordered at 2026-10-05T16:29:33Z by Prozess" in text
+    assert "Explorer.EXE (YODA)" in text
+    assert "vmIdleTimeout=-1 (C:\\Users\\gk\\.wslconfig)" in text
+    record = _exit_diag_records(tmp_path)[-1]
+    assert record["host_restart_1074"]["status"] == "hit"
+    assert record["host_restart_1074"]["at"] == "2026-10-05T16:29:33Z"
+    assert record["vm_idle_timeout"]["line"] == "vmIdleTimeout=-1"
+
+
+def test_no_host_restart_event_points_at_external_shutdown(tmp_path: Path, caplog, monkeypatch) -> None:
+    """Probed, and the host ordered NOTHING in the window — the claim that matters most, because it
+    is what separates an external ``wsl --shutdown`` from a user restart."""
+    now = time.time()
+    _unclean_life(tmp_path, started=now - 3600, heartbeat=now - 1800)
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: now - 60)
+    monkeypatch.setattr(
+        "gateway.lifecycle_ledger._host_restart_evidence",
+        lambda boot_epoch, since_epoch: (
+            {"status": "none"},
+            {"status": "absent", "path": "C:\\Users\\gk\\.wslconfig"},
+        ),
+    )
+
+    text = _warned(caplog, tmp_path)
+
+    assert "no Windows Event 1074 in that window — NOT a user/OS-ordered restart" in text
+    assert "external `wsl --shutdown` / WSL service stop, not OOM" in text
+    assert "vmIdleTimeout not set in C:\\Users\\gk\\.wslconfig" in text
+
+
+def test_unavailable_host_probe_omits_its_clauses_only(tmp_path: Path, caplog, monkeypatch) -> None:
+    """PowerShell absent/failed ⇒ no host clauses at all, but the reboot itself is still reported
+    and the warning still fires (forensics never block boot)."""
+    now = time.time()
+    _unclean_life(tmp_path, started=now - 3600, heartbeat=now - 1800)
+    monkeypatch.setattr("gateway.lifecycle_ledger._guest_boot_time", lambda: now - 60)
+
+    text = _warned(caplog, tmp_path)
+
+    assert "VM REBOOTED between lives" in text
+    assert "Windows Event 1074 ordered at" not in text
+    assert "no Windows Event 1074 in that window" not in text
+    assert "vmIdleTimeout" not in text
+    assert _exit_diag_records(tmp_path)[-1]["vm_rebooted"] is True
+
+
+def test_probe_script_bounds_the_death_window() -> None:
+    """The window must run from the previous life's last sighting to THIS boot, so an orderer from
+    an earlier life can never be attributed to this death."""
+    from gateway.lifecycle_ledger import _host_probe_script
+
+    script = _host_probe_script(1791223627.0, 1791224314.0)
+    assert "FromUnixTimeSeconds(1791223627)" in script
+    assert "FromUnixTimeSeconds(1791224316)" in script  # boot + _HOST_PROBE_SLACK_S
+    assert "EndTime=$ew" in script and "Id=1074" in script
+    assert "FullyQualifiedErrorId" in script  # the "no events" text is localized, the id is not
+
+
+def test_probe_script_delimiters_balance() -> None:
+    """A stray ``}}`` is a PowerShell parse error, and nothing else in this suite executes the
+    generated script — so an unbalanced brace would silently drop every clause the probe exists
+    to supply (it was caught this way on 2026-10-05)."""
+    from gateway.lifecycle_ledger import _host_probe_script
+
+    script = _host_probe_script(1791223627.0, 1791224314.0)
+    for opening, closing in (("{", "}"), ("(", ")")):
+        assert script.count(opening) == script.count(closing), f"unbalanced {opening}{closing}: {script}"
+
+
+@pytest.mark.platforms("windows")
+def test_probe_script_parses_in_a_real_powershell() -> None:
+    """The generated PowerShell itself: it is the one part no other test runs, and a script that
+    does not parse returns nothing, which reads as "no evidence" rather than as an error."""
+    import shutil
+
+    from gateway.lifecycle_ledger import _host_probe_script
+
+    hosts = [found for name in ("powershell.exe", "powershell", "pwsh") if (found := shutil.which(name))]
+    if not hosts:
+        pytest.skip("no PowerShell host")
+    result = subprocess.run(
+        [hosts[0], "-NoProfile", "-Command", _host_probe_script(time.time() - 3600, time.time())],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    stdout = result.stdout or ""
+    assert "EVENT|" in stdout, (result.returncode, stdout, result.stderr)
+    assert "IDLE|" in stdout, (result.returncode, stdout, result.stderr)
+
+
+def test_parse_host_probe_reads_the_exact_lines_the_probe_prints() -> None:
+    from gateway.lifecycle_ledger import _parse_host_probe
+
+    message = 'Vom Prozess "C:\\WINDOWS\\Explorer.EXE (YODA)" auf Anforderung von "YODA\\gk"'
+    stdout = (
+        "EVENT|HIT|2026-10-05T16:29:33Z|S-1-5-21-427566232-1001|"
+        + base64.b64encode(message.encode("utf-8")).decode("ascii")
+        + "\nIDLE|set|C:\\Users\\gk\\.wslconfig|vmIdleTimeout=-1\n"
+    )
+    assert _parse_host_probe(stdout) == (
+        {"status": "hit", "at": "2026-10-05T16:29:33Z", "sid": "S-1-5-21-427566232-1001", "message": message},
+        {"status": "set", "path": "C:\\Users\\gk\\.wslconfig", "line": "vmIdleTimeout=-1"},
+    )
+
+    assert _parse_host_probe("EVENT|NONE\nIDLE|absent|C:\\Users\\gk\\.wslconfig\n") == (
+        {"status": "none"},
+        {"status": "absent", "path": "C:\\Users\\gk\\.wslconfig"},
+    )
+    # Real event messages are multi-line: one warning line must stay one line.
+    multi = base64.b64encode("Ursachencode: 0x80000000\r\nHerunterfahrtyp: neu starten".encode()).decode()
+    assert _parse_host_probe(f"EVENT|HIT|2026-10-05T16:29:33Z|S-1-5-21-1001|{multi}\n")[0] == {
+        "status": "hit", "at": "2026-10-05T16:29:33Z", "sid": "S-1-5-21-1001",
+        "message": "Ursachencode: 0x80000000 Herunterfahrtyp: neu starten",
+    }
+    # A failed query is UNKNOWN — never read as "the host ordered nothing".
+    assert _parse_host_probe("EVENT|ERR\nIDLE|nofile\n") == ({"status": "unknown"}, {"status": "no_file"})
+    assert _parse_host_probe("") == (None, None)
+    assert _parse_host_probe(None) == (None, None)
