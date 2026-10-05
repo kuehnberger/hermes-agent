@@ -478,6 +478,16 @@ google = [
   # pyasn1 0.6.4, google-auth 2.55.1.
   "httplib2==0.32.0",
   "pyasn1==0.6.4",
+  # oauthlib 4.0.0 (CVE-2026-49265 / GHSA-xpv3-w29h-x7cv PKCE
+  # code_verifier timing side-channel, and GHSA-hj66-6f7g-4r5v JSONP
+  # revocation). google-auth-oauthlib -> requests-oauthlib pulls oauthlib
+  # transitively and pins nothing, so an unlocked editable install
+  # (`uv pip install -e ".[all]"`, which `hermes update` runs and which
+  # ignores uv.lock) still resolves oauthlib 3.3.1. The floor has to be
+  # declared by the owning extra to close that path; a uv.lock bump alone
+  # does not. 4.0.0's breaking changes are provider/server-side; Hermes
+  # uses the OAuth client flow only.
+  "oauthlib==4.0.0",
 ]
 youtube = [
   # Required by skills/media/youtube-content and
@@ -684,6 +694,13 @@ exclude-newer = "14 days"
 # google-cloud-pubsub: same exact-pin shape (==2.39.2, google-chat adapter).
 # The pin bump WAS the review; exclude-newer only filters it because the
 # 14-day window is younger than the reviewed release.
+#
+# oauthlib: temporary exclude-newer exception for the CVE-2026-49265
+# (GHSA-xpv3-w29h-x7cv, PKCE code_verifier timing side-channel) and
+# GHSA-hj66-6f7g-4r5v (JSONP revocation) fixes in 4.0.0, published
+# 2026-09-28. The [google] extra declares the same ==4.0.0 pin so unlocked
+# editable installs cannot fall back to 3.3.1; that pin cannot float, so the
+# 14-day cutoff buys no float protection while it can still brick installs.
 
 [tool.uv.exclude-newer-package]
 agent-client-protocol = false
@@ -740,6 +757,7 @@ modal = false
 nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
 numpy = false
+oauthlib = false
 openai = false
 opentelemetry-exporter-otlp-proto-http = false
 opentelemetry-sdk = false

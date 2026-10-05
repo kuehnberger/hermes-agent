@@ -50,6 +50,11 @@ _REQUIRED_PACKAGES = [
     "google-auth-httplib2==0.3.1",
     "httplib2==0.32.0",
     "pyasn1==0.6.4",
+    # oauthlib reaches this interpreter through google-auth-oauthlib ->
+    # requests-oauthlib, which pins nothing, so a half-synced env can still
+    # carry 3.3.1 (CVE-2026-49265 / GHSA-xpv3-w29h-x7cv PKCE timing
+    # side-channel). Listed here so the staleness probe repairs it.
+    "oauthlib==4.0.0",
 ]
 
 # Google deprecated the ``oob`` flow: use a localhost redirect that is expected
