@@ -120,6 +120,38 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
+_DEFAULT_WORKER_CPU_QUOTA_PERCENT = 150
+_WORKER_CPU_QUOTA_MAX_PERCENT = 200
+
+
+def _worker_cpu_quota_percent() -> int:
+    """Finite per-worker CPU cap in % of one core.
+
+    Workers (kanban, cron, long-job) previously got ``MemoryMax`` but no CPU
+    limit, so ``cpu.max`` defaulted to ``max 100000`` (unlimited). A single
+    worker (e.g. ``npm install --workspaces``) could saturate every core.
+    ``HERMES_WORKER_CPU_QUOTA_PERCENT`` may only *tighten* the safe bound
+    (200% = 2 cores); an oversized value is clamped via ``min`` exactly as
+    ``_worker_memory_max_bytes`` clamps TERMINAL_LOCAL_MEMORY_MAX_MB against
+    its safe bound, so an override can never widen the cap.
+    """
+    override = os.getenv("HERMES_WORKER_CPU_QUOTA_PERCENT", "").strip()
+    if override:
+        try:
+            parsed = int(override)
+        except ValueError:
+            parsed = -1
+        if parsed > 0:
+            return min(parsed, _WORKER_CPU_QUOTA_MAX_PERCENT)
+        logger.warning(
+            "Ignoring invalid HERMES_WORKER_CPU_QUOTA_PERCENT=%r; "
+            "expected a positive integer (at most %d)",
+            override,
+            _WORKER_CPU_QUOTA_MAX_PERCENT,
+        )
+    return _DEFAULT_WORKER_CPU_QUOTA_PERCENT
+
+
 def _worker_memory_max_bytes() -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
@@ -178,12 +210,14 @@ def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> list[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
-    ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
+    ``--expand-environment=no`` keeps the command byte-identical (#132385).
+    ``CPUQuota`` bounds CPU (default 150%, tighten-only override)."""
     no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
     return [
         binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property", f"CPUQuota={_worker_cpu_quota_percent()}%",
         "--", *argv,
     ]
 
@@ -327,7 +361,7 @@ def _is_supervised_gateway_process() -> bool:
 
 def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
-    memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
+    memory and CPU caps, so an OOM or CPU spike in the worker cannot take down the gateway cgroup.
 
     ``--collect`` makes the transient scope self-clean after exit; ``--unit`` gives it a recognisable name
     for ``systemctl --user status`` / journalctl. See #70716.

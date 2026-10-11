@@ -2564,6 +2564,61 @@ class TestSystemdCgroupIsolation:
 
         assert pr._worker_memory_max_bytes() == pr._DEFAULT_WORKER_MEMORY_MAX_BYTES
 
+    def test_worker_cpu_quota_default(self, monkeypatch):
+        """Default CPUQuota is 150% (1.5 cores)."""
+        import tools.process_registry as pr
+
+        monkeypatch.delenv("HERMES_WORKER_CPU_QUOTA_PERCENT", raising=False)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        argv = pr._build_systemd_scope_argv(
+            ["/bin/bash", "-lc", "true"],
+            unit_suffix="test",
+        )
+
+        assert "CPUQuota=150%" in argv
+
+    def test_worker_cpu_quota_honors_tightening_override(self, monkeypatch):
+        """HERMES_WORKER_CPU_QUOTA_PERCENT=100 tightens to 100%."""
+        import tools.process_registry as pr
+
+        monkeypatch.setenv("HERMES_WORKER_CPU_QUOTA_PERCENT", "100")
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        argv = pr._build_systemd_scope_argv(
+            ["/bin/bash", "-lc", "true"],
+            unit_suffix="test",
+        )
+
+        assert "CPUQuota=100%" in argv
+
+    def test_worker_cpu_quota_caps_oversized_override(self, monkeypatch):
+        """HERMES_WORKER_CPU_QUOTA_PERCENT=500 is clamped to the 200% safe bound."""
+        import tools.process_registry as pr
+
+        monkeypatch.setenv("HERMES_WORKER_CPU_QUOTA_PERCENT", "500")
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        argv = pr._build_systemd_scope_argv(
+            ["/bin/bash", "-lc", "true"],
+            unit_suffix="test",
+        )
+
+        assert "CPUQuota=200%" in argv
+
+    def test_worker_cpu_quota_probe_carries_quota(self, monkeypatch):
+        """The systemd-run probe argv also carries CPUQuota so the probe validates."""
+        import tools.process_registry as pr
+
+        monkeypatch.delenv("HERMES_WORKER_CPU_QUOTA_PERCENT", raising=False)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        argv = pr._systemd_scope_argv(
+            "/usr/bin/systemd-run", "hermes-worker-probe", "/bin/sh", "-c", "exit 0"
+        )
+
+        assert "CPUQuota=150%" in argv
+
     def test_kill_recovered_detached_already_exited_stops_persisted_scope(
         self, registry, monkeypatch
     ):
