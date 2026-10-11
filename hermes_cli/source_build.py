@@ -70,7 +70,9 @@ def run_source_script(project_root: Path, script: str, *args: str, env: dict, la
 def prepare_source_dependencies(project_root: Path, workspaces: tuple[str, ...], *, env: dict,
                                 explicit: bool = False) -> None:
     from pm import lazy_installs_allowed
+    from hermes_cli.web_build_limits import apply_web_build_limits
 
+    apply_web_build_limits(env)
     run_source_script(
         project_root, "scripts/build/node-deps.mjs", "--source", str(project_root), "--reuse",
         *(() if explicit or lazy_installs_allowed() else ("--no-install",)),

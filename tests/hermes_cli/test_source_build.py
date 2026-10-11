@@ -208,6 +208,34 @@ def _events(root):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+def test_prepare_source_dependencies_applies_web_build_limits(monkeypatch):
+    """prepare_source_dependencies must apply web_build_limits to the env,
+    just like build_source_web does, so npm install is CPU/heap capped."""
+    from hermes_cli.source_build import prepare_source_dependencies
+
+    captured_env = {}
+
+    def fake_run_source_script(project_root, script, *args, env, label):
+        captured_env.update(env)
+
+    monkeypatch.setattr(
+        "hermes_cli.source_build.run_source_script", fake_run_source_script
+    )
+    # prepare_source_dependencies imports lazy_installs_allowed from pm
+    import pm
+    monkeypatch.setattr(pm, "lazy_installs_allowed", lambda: True)
+
+    env = {"PATH": "/usr/bin", "HOME": "/tmp"}
+    prepare_source_dependencies(Path("/tmp/fake"), ("web",), env=env)
+
+    # apply_web_build_limits sets RAYON_NUM_THREADS and NODE_OPTIONS
+    assert "RAYON_NUM_THREADS" in captured_env
+    assert "NODE_OPTIONS" in captured_env
+    assert "--max-old-space-size=" in captured_env["NODE_OPTIONS"]
+    threads = int(captured_env["RAYON_NUM_THREADS"])
+    assert 1 <= threads <= 8
+
+
 @pytest.mark.platforms("posix")
 def test_preparation_reuses_only_the_exact_completed_workspace_union(source_checkout):
     from hermes_cli.source_build import prepare_source_dependencies, source_build_env
