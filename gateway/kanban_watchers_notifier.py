@@ -599,7 +599,27 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+        # The card's own dashboard URL, so the woken agent can cite the card instead of
+        # pasting a bare task id. Omitted when no dashboard URL is resolvable (see
+        # hermes_cli.kanban_links) — never a link that does not resolve.
+        card_url = self._card_url()
+        if card_url:
+            synth += "\n" + t("gateway.kanban.wake.card_url", url=card_url)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+
+    def _card_url(self) -> str:
+        """Dashboard deep link for this card, or ``""`` when none can be built.
+
+        A notification must never fail to send because a link could not be built, so
+        every failure here degrades to "no link line".
+        """
+        try:
+            from hermes_cli.kanban_links import task_url
+
+            return task_url(self.task_id, board=self.board_slug) or ""
+        except Exception:  # pragma: no cover  # health: allow BLE001 -- a missing link must never break a notification
+            logger.debug("kanban notifier: card url resolution failed for %s", self.task_id, exc_info=True)
+            return ""
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

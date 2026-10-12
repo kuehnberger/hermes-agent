@@ -796,3 +796,45 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_wake_turn_carries_the_card_url(tmp_path, monkeypatch):
+    """The wake turn names the card's dashboard URL, so the woken agent can cite it."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card-url-wake.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_links.task_url",
+        lambda task_id, board=None: f"http://localhost:9119/kanban?board={board}&task={task_id}",
+    )
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    wake = _wake_text(adapter)
+    assert tid in wake
+    assert f"task={tid}" in wake, (
+        "the wake turn must carry a resolvable card link; a bare task id is not clickable"
+    )
+    assert "http://localhost:9119/kanban?" in wake
+
+
+def test_wake_turn_omits_the_url_when_none_resolves(tmp_path, monkeypatch):
+    """No dashboard URL must mean no link line — never a link that does not resolve."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card-url-none.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_links.task_url", lambda task_id, board=None: None
+    )
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    wake = _wake_text(adapter)
+    assert tid in wake
+    assert "http://" not in wake and "https://" not in wake.replace(
+        "https://example.invalid/pr/7", ""
+    ), "no dashboard URL configured -> no link line at all"
