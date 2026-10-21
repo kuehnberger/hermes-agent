@@ -25,6 +25,7 @@ Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OA
 
 - `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)
 - `references/daily-brief.md` — daily/morning brief procedure: schedule + conflicts + meeting prep + urgent mail from Gmail and Calendar. Load it when the user asks for a morning brief, meeting preparation, or "what's on my calendar and what email needs attention."
+- `references/fleet-credential-sharing.md` — sharing one Google credential across all profiles: where the token lives, the symlink bridge, the 0600 rule, and the scope-policy sidecar. Load it when authorizing, rotating, or moving the credential, or when `--check` reports missing scopes.
 
 ## Scripts
 
