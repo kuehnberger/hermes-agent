@@ -15,6 +15,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from _gws_policy import write_secret
 from _hermes_home import get_hermes_home
 
 
@@ -75,8 +76,10 @@ def refresh_token(token_data: dict) -> dict:
         tz=UTC,
     ).isoformat()
 
-    get_token_path().write_text(
-        json.dumps(_normalize_authorized_user_payload(token_data), indent=2), encoding="utf-8"
+    # The refreshed token is still a bearer credential: keep it 0600.
+    write_secret(
+        get_token_path(),
+        json.dumps(_normalize_authorized_user_payload(token_data), indent=2),
     )
     return token_data
 

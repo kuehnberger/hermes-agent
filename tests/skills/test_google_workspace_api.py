@@ -172,7 +172,10 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
         @staticmethod
         def from_authorized_user_file(filename, scopes):
             assert filename == str(token_path)
-            assert scopes == api_module.SCOPES
+            # The token records no scopes, so the refresh must NOT request the
+            # global default set: asking for scopes the grant never had makes
+            # Google answer invalid_scope and breaks every API call.
+            assert scopes is None
             return FakeCredentials()
 
     google_module = types.ModuleType("google")
@@ -195,6 +198,67 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
     assert isinstance(creds, FakeCredentials)
     assert saved["token"] == "ya29.refreshed"
     assert saved["type"] == "authorized_user"
+
+
+def test_api_get_credentials_refresh_uses_the_tokens_own_scopes(
+    api_module: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reduced-scope token must be refreshed with exactly its own scopes.
+
+    Widening the request to the global eight-scope set makes Google answer
+    ``invalid_scope`` for a grant that never had them, which breaks every
+    subsequent API call.
+    """
+    token_path = api_module.TOKEN_PATH
+    _write_token(
+        token_path,
+        token="ya29.old",
+        scopes=["https://www.googleapis.com/auth/calendar"],
+    )
+
+    seen: dict = {}
+
+    class FakeCredentials:
+        expired = True
+        refresh_token = "1//refresh"
+        valid = True
+
+        def refresh(self, request):
+            self.expired = False
+
+        def to_json(self):
+            return json.dumps({
+                "token": "ya29.refreshed",
+                "refresh_token": "1//refresh",
+                "client_id": "123.apps.googleusercontent.com",
+                "client_secret": "secret",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            })
+
+    class FakeCredentialsModule:
+        @staticmethod
+        def from_authorized_user_file(filename, scopes):
+            seen["scopes"] = scopes
+            return FakeCredentials()
+
+    google_module = types.ModuleType("google")
+    oauth2_module = types.ModuleType("google.oauth2")
+    credentials_module = types.ModuleType("google.oauth2.credentials")
+    credentials_module.Credentials = FakeCredentialsModule
+    transport_module = types.ModuleType("google.auth.transport")
+    requests_module = types.ModuleType("google.auth.transport.requests")
+    requests_module.Request = lambda: object()
+
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2.credentials", credentials_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", requests_module)
+
+    api_module.get_credentials()
+
+    assert seen["scopes"] == ["https://www.googleapis.com/auth/calendar"]
 
 
 def test_gmail_search_empty_result_prints_json_array(
