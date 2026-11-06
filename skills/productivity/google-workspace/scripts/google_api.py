@@ -36,6 +36,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from _gws_policy import write_secret
 from _hermes_home import get_hermes_home
 
 HERMES_HOME = get_hermes_home()
@@ -68,15 +69,22 @@ def _ensure_authenticated():
         sys.exit(1)
 
 
-def _stored_token_scopes() -> list[str]:
+def _stored_token_scopes() -> list[str] | None:
+    """Scopes the stored token actually holds, or None when unrecorded.
+
+    Returning the *global* default list as a fallback is what breaks reduced-scope
+    tokens: google-auth then asks Google for all eight scopes on refresh and the
+    call fails with ``invalid_scope``, because the grant never had them.  None
+    means "do not narrow the refresh" — the server re-issues the original grant.
+    """
     try:
         data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return list(SCOPES)
+        return None
     scopes = data.get("scopes")
     if isinstance(scopes, list) and scopes:
         return scopes
-    return list(SCOPES)
+    return None
 
 
 def _gws_binary() -> str | None:
@@ -253,11 +261,13 @@ def get_credentials():
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(
+        # The rewritten token is still a bearer credential: keep it 0600.
+        write_secret(
+            TOKEN_PATH,
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,
-            ), encoding="utf-8"
+            ),
         )
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)
