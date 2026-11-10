@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
-version: 1.2.0
+version: 1.3.0
 author: Nous Research
 license: MIT
 platforms: [linux, macos, windows]
@@ -25,6 +25,7 @@ Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OA
 
 - `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)
 - `references/daily-brief.md` — daily/morning brief procedure: schedule + conflicts + meeting prep + urgent mail from Gmail and Calendar. Load it when the user asks for a morning brief, meeting preparation, or "what's on my calendar and what email needs attention."
+- `references/fleet-credential-sharing.md` — sharing one Google credential across all profiles: where the token lives, the symlink bridge, the 0600 rule, and the scope-policy sidecar. Load it when authorizing, rotating, or moving the credential, or when `--check` reports missing scopes.
 
 ## Scripts
 
@@ -169,6 +170,57 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 - Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` until exchange completes.
 - If `gws` is installed, `google_api.py` points it at the same `~/.hermes/google_token.json` credentials file. Users do not need to run a separate `gws auth login` flow.
 - To revoke: `$GSETUP --revoke`
+
+### Credential files and scope policy
+
+All credential files are written with mode `0600` (owner read/write only) — the
+token, the client secret, the pending OAuth session and the last auth URL are
+all bearer credentials and must not be readable by other users on the host.
+
+The set of Google scopes this deployment expects is **policy**, and it is
+resolved in this order (first hit wins):
+
+| Source | Notes |
+|--------|-------|
+| `--services` on the command line | One-off override of the consent request only. |
+| `HERMES_GOOGLE_SCOPES` | Comma-separated service names or scope URLs. |
+| `google_oauth_policy.json` | Policy sidecar, looked up next to the token file and then in `HERMES_HOME`. |
+| *(default)* | The full Workspace scope set. |
+
+The same resolved set drives the consent request **and** the "missing scopes"
+report in `--check`. That is what keeps a deliberately narrowed grant from
+producing a permanent `AUTHENTICATED (partial): missing N scopes` warning in
+every profile that shares the token.
+
+The policy lives in a sidecar rather than inside `google_token.json` because
+`google-auth` rewrites the token file on every refresh and drops any key it
+does not know — a policy stored inside the token would silently disappear.
+
+**Sharing one token across several Hermes profiles.** A profile may point its
+credential files at a shared store instead of keeping its own copy:
+
+```bash
+ln -s ~/.hermes/google_token.json        ~/.hermes/profiles/<name>/google_token.json
+ln -s ~/.hermes/google_client_secret.json ~/.hermes/profiles/<name>/google_client_secret.json
+```
+
+Put the policy sidecar next to the shared token
+(`~/.hermes/google_oauth_policy.json`) so every profile compares against the
+same expectation:
+
+```json
+{"services": "calendar", "scopes": ["https://www.googleapis.com/auth/calendar"]}
+```
+
+A token refresh always uses the scopes the token actually holds, never the
+global default set — requesting scopes a grant never had makes Google answer
+`invalid_scope` and breaks every API call.
+
+**Remote backends (Docker/Modal).** `tools/credential_files.py` refuses to
+mount a credential whose resolved path escapes the profile home, so a profile
+that symlinks its token at a fleet root outside its own home cannot have that
+token mounted into a remote sandbox. Use the local backend for those profiles,
+or give the profile its own token file.
 
 ## Usage
 
@@ -331,7 +383,7 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 | `NOT_AUTHENTICATED` | Run setup Steps 2-5 above |
 | `REFRESH_FAILED` | Token revoked or expired — redo Steps 3-5 |
 | `HttpError 403: Insufficient Permission` | Missing API scope — `$GSETUP --revoke` then redo Steps 3-5 |
-| `AUTHENTICATED (partial)` or "Token missing scopes" | New write capabilities (Drive write/delete, Docs create/edit) require re-authorization. `$GSETUP --revoke` then redo Steps 3-5 to grant the upgraded scopes. |
+| `AUTHENTICATED (partial)` or "Token missing scopes" | New write capabilities (Drive write/delete, Docs create/edit) require re-authorization. `$GSETUP --revoke` then redo Steps 3-5 to grant the upgraded scopes. If the deployment deliberately runs with a narrower scope set, record it in the policy sidecar (`google_oauth_policy.json`) — the warning is measured against that policy. |
 | `HttpError 403: Access Not Configured` | API not enabled — user needs to enable it in Google Cloud Console |
 | `ModuleNotFoundError` | Run `$GSETUP --install-deps` |
 | Advanced Protection blocks auth | Workspace admin must allowlist the OAuth client ID |
