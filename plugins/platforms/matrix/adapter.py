@@ -216,6 +216,14 @@ _MATRIX_PERMANENT_ERRCODES = frozenset({
     "m_forbidden",
 })
 
+# Token-auth (whoami) retry policy. A transient homeserver error (5xx/429/timeout) is NOT a
+# credential problem: the sync loop already classifies it via ``_is_permanent_matrix_auth_error``
+# and retries forever, while the connect path used to abort on the first such error and leave the
+# lane to the gateway watcher's 30-300s backoff. This short in-adapter retry clears the sub-10s
+# blips that would otherwise cost a full watcher cycle each.
+_TOKEN_AUTH_MAX_ATTEMPTS = 3
+_TOKEN_AUTH_RETRY_DELAY_S = 2
+
 
 def _is_permanent_matrix_auth_error(exc: BaseException) -> bool:
     """Return True only for genuine auth failures that must stop the sync loop.
@@ -1112,68 +1120,118 @@ class MatrixAdapter(BasePlatformAdapter):
         return False
 
     async def _connect_authenticate(self, client: Any, api: Any) -> bool:
-        """Authenticate via access token (whoami) or password login; resolve user/device IDs."""
+        """Authenticate via access token (whoami) or password login; resolve user/device IDs.
+
+        Token auth is tried first (a stored token is stateless and cannot collide with another
+        device). If it fails, a configured password is the fallback: a stale/revoked token
+        (e.g. invalidated by a device-collision password login) is recovered without an operator
+        edit. Only when neither path is available does connect abort.
+        """
         if self._access_token:
             api.token = self._access_token
+            if await self._authenticate_with_access_token(client):
+                return True
+            # Token auth failed. Fall back to a configured password (a stale/revoked token,
+            # e.g. invalidated by a device-collision login, recovers here). No password means
+            # there is nothing to fall back to.
+            if self._password and self._user_id:
+                logger.warning(
+                    "Matrix: access-token auth failed; falling back to password login")
+                api.token = ""
+                return await self._authenticate_with_password(client, api)
+            logger.error(
+                "Matrix: access-token auth failed and no MATRIX_PASSWORD fallback is configured")
+            return await self._abort_connect(api)
+        if self._password and self._user_id:
+            return await self._authenticate_with_password(client, api)
+        logger.error("Matrix: need MATRIX_ACCESS_TOKEN or MATRIX_USER_ID + MATRIX_PASSWORD")
+        return await self._abort_connect(api)
+
+    async def _authenticate_with_access_token(self, client: Any) -> bool:
+        """whoami() with a bounded retry for transient homeserver errors.
+
+        A transient outage (5xx/429/timeout) is not a credential problem: the sync loop already
+        classifies it via ``_is_permanent_matrix_auth_error`` and retries forever, while this
+        connect path used to abort on the first such error and leave the lane to the gateway
+        watcher's 30-300s backoff. The bounded in-adapter retry clears sub-10s blips that would
+        otherwise cost one watcher cycle each.
+        """
+        for attempt in range(1, _TOKEN_AUTH_MAX_ATTEMPTS + 1):
             try:
                 resp = await client.whoami()
-                resolved_user_id = getattr(resp, "user_id", "") or self._user_id
-                resolved_device_id = str(getattr(resp, "device_id", "") or "")
-                if resolved_user_id:
-                    self._user_id = str(resolved_user_id)
-                    client.mxid = UserID(self._user_id)
-                # Configured device_id wins when whoami() reports none; on conflict whoami() wins, loudly.
-                if resolved_device_id and self._device_id and resolved_device_id != self._device_id:
+            except Exception as exc:
+                proxy = describe_proxy_error(
+                    exc, matrix_redaction_proxy(self._proxy_url, self._homeserver))
+                if _is_permanent_matrix_auth_error(exc):
                     logger.error(
-                        "Matrix: MATRIX_DEVICE_ID=%s does not match the device this access token "
-                        "belongs to (%s). A token can only upload keys for its own device, so the "
-                        "configured value is being ignored. Unset MATRIX_DEVICE_ID, or use a token "
-                        "issued for %s.", self._device_id, resolved_device_id, self._device_id)
-                    effective_device_id = resolved_device_id
-                else:
-                    effective_device_id = self._device_id or resolved_device_id
-                if effective_device_id:
-                    client.device_id = effective_device_id
-                if not client.device_id:
-                    try:
-                        dev_resp = await client.query_keys({client.mxid: []})
-                        all_devices = (getattr(dev_resp, "device_keys", {}) or {}).get(str(client.mxid)) or {}
-                        if len(all_devices) == 1:
-                            client.device_id = next(iter(all_devices))
-                        elif not all_devices:
-                            logger.warning(
-                                "Matrix: no devices found for %s — key verification will be skipped", client.mxid)
-                    except Exception as exc:
-                        logger.warning("Matrix: device list query failed: %s", exc)
-                if not client.device_id:
+                        "Matrix: token auth failed permanently (access token is invalid or "
+                        "revoked): %s", proxy or exc)
+                    return False
+                if attempt < _TOKEN_AUTH_MAX_ATTEMPTS:
                     logger.warning(
-                        "Matrix: device_id could not be resolved for %s. Set MATRIX_DEVICE_ID for full "
-                        "key verification. E2EE will proceed without server-side device key confirmation.",
-                        client.mxid)
-                    self._device_id_unverified = True
-                logger.info(
-                    "Matrix: using access token for %s%s", self._user_id or "(unknown user)",
-                    f" (device {effective_device_id})" if effective_device_id else "")
-            except Exception as exc:
-                proxy_error = describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver))
-                logger.error("Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
-                             proxy_error or exc, exc_info=not proxy_error)
-                return await self._abort_connect(api)
-        elif self._password and self._user_id:
-            try:
-                resp = await client.login(
-                    identifier=self._user_id, password=self._password, device_name="Hermes Agent",
-                    device_id=self._device_id or None)
-                if resp and hasattr(resp, "device_id"):
-                    client.device_id = resp.device_id
-                logger.info("Matrix: logged in as %s", self._user_id)
-            except Exception as exc:
-                logger.error("Matrix: login failed — %s", describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
-                return await self._abort_connect(api)
-        else:
-            logger.error("Matrix: need MATRIX_ACCESS_TOKEN or MATRIX_USER_ID + MATRIX_PASSWORD")
+                        "Matrix: token auth failed transiently (attempt %d/%d) — retrying in %ds: %s",
+                        attempt, _TOKEN_AUTH_MAX_ATTEMPTS, _TOKEN_AUTH_RETRY_DELAY_S, proxy or exc)
+                    await asyncio.sleep(_TOKEN_AUTH_RETRY_DELAY_S)
+                    continue
+                logger.error(
+                    "Matrix: token auth failed after %d attempts: %s",
+                    _TOKEN_AUTH_MAX_ATTEMPTS, proxy or exc)
+                return False
+            resolved_user_id = getattr(resp, "user_id", "") or self._user_id
+            resolved_device_id = str(getattr(resp, "device_id", "") or "")
+            if resolved_user_id:
+                self._user_id = str(resolved_user_id)
+                client.mxid = UserID(self._user_id)
+            # Configured device_id wins when whoami() reports none; on conflict whoami() wins, loudly.
+            if resolved_device_id and self._device_id and resolved_device_id != self._device_id:
+                logger.error(
+                    "Matrix: MATRIX_DEVICE_ID=%s does not match the device this access token "
+                    "belongs to (%s). A token can only upload keys for its own device, so the "
+                    "configured value is being ignored. Unset MATRIX_DEVICE_ID, or use a token "
+                    "issued for %s.", self._device_id, resolved_device_id, self._device_id)
+                effective_device_id = resolved_device_id
+            else:
+                effective_device_id = self._device_id or resolved_device_id
+            if effective_device_id:
+                client.device_id = effective_device_id
+            if not client.device_id:
+                try:
+                    dev_resp = await client.query_keys({client.mxid: []})
+                    all_devices = (getattr(dev_resp, "device_keys", {}) or {}).get(str(client.mxid)) or {}
+                    if len(all_devices) == 1:
+                        client.device_id = next(iter(all_devices))
+                    elif not all_devices:
+                        logger.warning(
+                            "Matrix: no devices found for %s — key verification will be skipped", client.mxid)
+                except Exception as exc:
+                    logger.warning("Matrix: device list query failed: %s", exc)
+            if not client.device_id:
+                logger.warning(
+                    "Matrix: device_id could not be resolved for %s. Set MATRIX_DEVICE_ID for full "
+                    "key verification. E2EE will proceed without server-side device key confirmation.",
+                    client.mxid)
+                self._device_id_unverified = True
+            logger.info(
+                "Matrix: using access token for %s%s", self._user_id or "(unknown user)",
+                f" (device {effective_device_id})" if effective_device_id else "")
+            return True
+        return False
+
+    async def _authenticate_with_password(self, client: Any, api: Any) -> bool:
+        """Password login (mints a fresh device token) — the fallback when a stored token is bad."""
+        try:
+            resp = await client.login(
+                identifier=self._user_id, password=self._password, device_name="Hermes Agent",
+                device_id=self._device_id or None)
+            if resp and hasattr(resp, "device_id"):
+                client.device_id = resp.device_id
+            logger.info("Matrix: logged in as %s", self._user_id)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Matrix: login failed — %s",
+                describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
             return await self._abort_connect(api)
-        return True
 
     async def _connect_setup_e2ee(self, client: Any, api: Any, state_store: Any) -> bool:
         """Set up the Olm machine + crypto store. Returns False when connect must abort."""
