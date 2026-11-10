@@ -859,6 +859,140 @@ class TestMatrixAccessTokenAuth:
         await adapter.disconnect()
 
 
+class TestMatrixTokenAuthFallback:
+    """Token auth must not abort on a transient homeserver error, and must fall back to a
+    configured password when the stored token is invalid or revoked.
+
+    Regression context: matrix.org degraded 2026-11-10 (Synapse ``degraded_performance``). The
+    default profile's stored token was still valid, but whoami returned
+    ``MUnknown: Unable to introspect the access token`` (HTTP 503) and the adapter aborted the
+    connect attempt on every retry — the lane stayed down for the whole outage. The sync loop
+    already classified this via ``_is_permanent_matrix_auth_error`` and retried; the connect
+    path did not.
+    """
+
+    @staticmethod
+    def _make_adapter(*, token="syt_stale", password=None):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+        extra = {"homeserver": "https://matrix.example.org", "user_id": "@bot:example.org"}
+        if password is not None:
+            extra["password"] = password
+        return MatrixAdapter(PlatformConfig(enabled=True, token=token, extra=extra))
+
+    @staticmethod
+    def _make_api():
+        api = MagicMock()
+        api.session = MagicMock()
+        api.session.close = AsyncMock()
+        return api
+
+    @pytest.mark.asyncio
+    async def test_transient_whoami_failure_retries_then_aborts_without_password(self, monkeypatch):
+        """A 5xx whoami failure is transient: retry, then abort (no password configured)."""
+        from plugins.platforms.matrix import adapter as matrix_mod
+
+        monkeypatch.setattr(matrix_mod, "_TOKEN_AUTH_RETRY_DELAY_S", 0)
+        adapter = self._make_adapter()
+
+        class TransientError(Exception):
+            errcode = "M_UNKNOWN"
+            http_status = 503
+
+        client = MagicMock()
+        client.whoami = AsyncMock(side_effect=TransientError("Unable to introspect the access token"))
+        client.login = AsyncMock()
+
+        assert await adapter._connect_authenticate(client, self._make_api()) is False
+        assert client.whoami.await_count == matrix_mod._TOKEN_AUTH_MAX_ATTEMPTS
+        client.login.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_whoami_failure_falls_back_to_password(self, monkeypatch):
+        """A 5xx whoami failure is retried, then a configured password recovers the lane."""
+        from plugins.platforms.matrix import adapter as matrix_mod
+
+        monkeypatch.setattr(matrix_mod, "_TOKEN_AUTH_RETRY_DELAY_S", 0)
+        adapter = self._make_adapter(password="secret")
+
+        class TransientError(Exception):
+            errcode = "M_UNKNOWN"
+            http_status = 503
+
+        client = MagicMock()
+        client.whoami = AsyncMock(side_effect=TransientError("Unable to introspect the access token"))
+        client.login = AsyncMock(return_value=MagicMock(device_id="DEV123"))
+
+        assert await adapter._connect_authenticate(client, self._make_api()) is True
+        assert client.whoami.await_count == matrix_mod._TOKEN_AUTH_MAX_ATTEMPTS
+        client.login.assert_awaited_once()
+        assert client.device_id == "DEV123"
+
+    @pytest.mark.asyncio
+    async def test_permanent_whoami_failure_falls_back_to_password_without_retry(self, monkeypatch):
+        """A 401/M_UNKNOWN_TOKEN whoami failure is permanent: no retry, straight to password."""
+        from plugins.platforms.matrix import adapter as matrix_mod
+
+        monkeypatch.setattr(matrix_mod, "_TOKEN_AUTH_RETRY_DELAY_S", 0)
+        adapter = self._make_adapter(password="secret")
+
+        class PermanentError(Exception):
+            errcode = "M_UNKNOWN_TOKEN"
+            http_status = 401
+
+        client = MagicMock()
+        client.whoami = AsyncMock(side_effect=PermanentError("Unknown access token"))
+        client.login = AsyncMock(return_value=MagicMock(device_id="DEV123"))
+
+        assert await adapter._connect_authenticate(client, self._make_api()) is True
+        assert client.whoami.await_count == 1
+        client.login.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_permanent_whoami_failure_without_password_aborts(self, monkeypatch):
+        """A 401/M_UNKNOWN_TOKEN whoami failure with no password configured must abort."""
+        from plugins.platforms.matrix import adapter as matrix_mod
+
+        monkeypatch.setattr(matrix_mod, "_TOKEN_AUTH_RETRY_DELAY_S", 0)
+        adapter = self._make_adapter()
+
+        class PermanentError(Exception):
+            errcode = "M_UNKNOWN_TOKEN"
+            http_status = 401
+
+        client = MagicMock()
+        client.whoami = AsyncMock(side_effect=PermanentError("Unknown access token"))
+        client.login = AsyncMock()
+
+        assert await adapter._connect_authenticate(client, self._make_api()) is False
+        assert client.whoami.await_count == 1
+        client.login.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_whoami_failure_recovers_on_later_attempt(self, monkeypatch):
+        """A transient failure that clears before the retry budget is used authenticates normally."""
+        from plugins.platforms.matrix import adapter as matrix_mod
+
+        monkeypatch.setattr(matrix_mod, "_TOKEN_AUTH_RETRY_DELAY_S", 0)
+        adapter = self._make_adapter()
+
+        class FakeWhoamiResponse:
+            user_id = "@bot:example.org"
+            device_id = "DEV123"
+
+        class TransientError(Exception):
+            errcode = "M_UNKNOWN"
+            http_status = 503
+
+        client = MagicMock()
+        client.whoami = AsyncMock(side_effect=[TransientError("blip"), FakeWhoamiResponse()])
+        client.query_keys = AsyncMock(return_value=MagicMock(device_keys={}))
+        client.login = AsyncMock()
+
+        assert await adapter._connect_authenticate(client, self._make_api()) is True
+        assert client.whoami.await_count == 2
+        client.login.assert_not_awaited()
+
+
 class TestDeviceKeyReVerification:
     @pytest.mark.asyncio
     async def test_verify_fails_when_server_keys_mismatch_after_upload(self):
