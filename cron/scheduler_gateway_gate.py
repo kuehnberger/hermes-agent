@@ -81,3 +81,47 @@ def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
         "Cron tick for %s skipped %d agent job(s) (%s): %s",
         home, len(ids), ", ".join(ids), hint)
     return [job for job in due_jobs if job.get("no_agent")]
+
+
+FENCED_HINT = (
+    "the install is fenced (an update owns the tree), so agent jobs cannot fire; they run at the "
+    "next tick once the fence lifts."
+)
+
+
+def refuse_agent_jobs_while_fenced(due_jobs: list) -> list:
+    """Return the due jobs the IN-PROCESS ticker may dispatch; agent jobs are held back
+    (skipped, not failed) while an update owns the install.
+
+    The in-process ticker runs inside the gateway, so the headless gate above never sees it.
+    While the install is fenced the gateway refuses new turns (``draining: update_paused``), so
+    the agent's connect fails - but the cron MONITOR has already run by then and persisted its
+    output hash inside ``check_monitor``. The next tick reads the same hash, sees
+    ``changed=False`` and suppresses the agent run: the change is never delivered and never
+    re-alerted, and the monitor's blind window is silent.
+
+    Holding the job HERE - before the monitor gate runs - defers the whole fire instead of
+    skipping it: the monitor state is untouched, no run is recorded, the due instant does not
+    move, and the next tick delivers the change.
+
+    Fails open: if the fence cannot be read, the tick behaves as it does today.
+    """
+    from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
+
+    agent_jobs = [job for job in due_jobs if not job.get("no_agent")]
+    if not agent_jobs:
+        return due_jobs
+    try:
+        from hermes_cli.gateway_runtime import _update_fenced
+
+        homes = {get_hermes_home().resolve(), get_process_hermes_home(), get_default_hermes_root()}
+        if not _update_fenced(homes):
+            return due_jobs
+    except Exception:  # a deliberate fail-open boundary: a broken import must never stop the tick
+        logger.debug("Fence check unavailable, dispatching as usual", exc_info=True)
+        return due_jobs
+    ids = [str(job["id"]) for job in agent_jobs]
+    _note_fire_refused(ids, f"Skipped: {FENCED_HINT}")
+    logger.warning(
+        "Cron tick skipped %d agent job(s) (%s): %s", len(ids), ", ".join(ids), FENCED_HINT)
+    return [job for job in due_jobs if job.get("no_agent")]

@@ -134,6 +134,15 @@ def _tick_admitted(
         if headless:
             from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway
             due_jobs = refuse_agent_jobs_without_gateway(due_jobs)
+        else:
+            # The in-process ticker runs inside the gateway, so the headless gate above never
+            # sees it. While an update owns the tree the gateway refuses new turns
+            # ("draining: update_paused"), so the agent's connect would fail AFTER the cron
+            # monitor already persisted its output hash - the change would never be delivered.
+            # Hold the agent jobs here, before the monitor gate runs, so the whole fire is
+            # deferred to the next tick with the monitor state untouched.
+            from cron.scheduler_gateway_gate import refuse_agent_jobs_while_fenced
+            due_jobs = refuse_agent_jobs_while_fenced(due_jobs)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
